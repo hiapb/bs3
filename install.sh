@@ -1126,7 +1126,15 @@ add_cron_job() {
 
     local CRON_LINE="$CRON_EXPR export PATH=\"/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:\$PATH\"; bash $script_q run $account_q $local_q $bucket_q $remote_q >/dev/null 2>&1 $TAG[$ACCOUNT_ID][$S3_BUCKET]"
 
-    (crontab -l 2>/dev/null; echo "$CRON_LINE") | crontab -
+    if ! command_exists crontab; then
+        echo "❌ 未检测到 crontab，无法添加定时任务。请先安装 cron/cronie。"
+        return 1
+    fi
+
+    if ! (crontab -l 2>/dev/null; echo "$CRON_LINE") | crontab -; then
+        echo "❌ 定时任务添加失败，请检查 crontab 是否可用。"
+        return 1
+    fi
 
     echo "✅ 定时任务已添加："
     echo "   $CRON_LINE"
@@ -1292,7 +1300,10 @@ add_backup_job() {
             ;;
     esac
 
-    add_cron_job "$CRON_EXPR" "$LOCAL_PATH" "$S3_BUCKET" "$REMOTE_DIR" "$ACCOUNT_ID"
+    if ! add_cron_job "$CRON_EXPR" "$LOCAL_PATH" "$S3_BUCKET" "$REMOTE_DIR" "$ACCOUNT_ID"; then
+        pause
+        return
+    fi
 
     echo
     read -rp "⚡ 是否立即执行一次此备份任务？(Y/n)： " run_now
