@@ -316,6 +316,188 @@ show_s3_buckets_for_current_account() {
     done
 }
 
+read_s3_bucket_name_only() {
+    local var_name="$1"
+    local prompt="$2"
+    local value
+
+    read -rp "$prompt " value
+    normalize_bucket_input "$value"
+
+    if [[ -z "$NORMALIZED_BUCKET" ]]; then
+        echo "❌ Bucket 不能为空。"
+        return 1
+    fi
+
+    if [[ -n "$NORMALIZED_BUCKET_PREFIX" ]]; then
+        echo "❌ 这里只能输入存储桶名称，不能带目录/前缀：$NORMALIZED_BUCKET_PREFIX"
+        return 1
+    fi
+
+    printf -v "$var_name" '%s' "$NORMALIZED_BUCKET"
+    return 0
+}
+
+create_s3_bucket_current_account() {
+    echo "======================================="
+    echo "➕ 新增存储桶"
+    echo "======================================="
+
+    local new_bucket
+    read_s3_bucket_name_only new_bucket "🪣 请输入新 Bucket / 存储桶名称：" || return
+
+    echo
+    echo "🪣 新存储桶：$new_bucket"
+    read -rp "⚠️ 确认创建这个存储桶吗？(y/N)： " yn
+    case "$yn" in
+        y|Y)
+            if run_aws s3 mb "s3://$new_bucket"; then
+                echo "✅ 存储桶已创建：$new_bucket"
+            else
+                echo "❌ 创建失败，请检查名称是否已被占用、Region/Endpoint/权限是否正确。"
+            fi
+            ;;
+        *)
+            echo "ℹ️ 已取消创建。"
+            ;;
+    esac
+}
+
+delete_s3_bucket_current_account() {
+    echo "======================================="
+    echo "🗑 删除存储桶"
+    echo "======================================="
+
+    local target_bucket
+    select_s3_bucket target_bucket "" || return
+
+    echo
+    echo "🪣 准备删除存储桶：$target_bucket"
+    echo "1) 🗑 只删除空存储桶"
+    echo "2) ⚠️ 强制删除存储桶及里面所有文件"
+    echo "0) ⬅ 取消"
+    read -rp "👉 请选择删除方式： " mode
+
+    case "$mode" in
+        1)
+            read -rp "⚠️ 确认删除空存储桶 $target_bucket 吗？(y/N)： " yn
+            if [[ "$yn" =~ ^[Yy]$ ]]; then
+                if run_aws s3 rb "s3://$target_bucket"; then
+                    echo "✅ 已删除空存储桶：$target_bucket"
+                else
+                    echo "❌ 删除失败。这个桶可能不为空，或权限不足。"
+                fi
+            else
+                echo "ℹ️ 已取消删除。"
+            fi
+            ;;
+        2)
+            echo "⚠️ 这会删除 s3://$target_bucket 里面的所有文件，无法恢复。"
+            read -rp "🔒 请输入存储桶名称 [$target_bucket] 以确认： " confirm_name
+            if [[ "$confirm_name" != "$target_bucket" ]]; then
+                echo "❌ 名称不匹配，已取消。"
+                return
+            fi
+
+            if run_aws s3 rb "s3://$target_bucket" --force; then
+                echo "✅ 已强制删除存储桶及其内容：$target_bucket"
+            else
+                echo "❌ 强制删除失败，请检查权限或对象锁/版本控制设置。"
+            fi
+            ;;
+        0)
+            echo "ℹ️ 已取消删除。"
+            ;;
+        *)
+            echo "❌ 无效选项。"
+            ;;
+    esac
+}
+
+edit_s3_bucket_current_account() {
+    echo "======================================="
+    echo "✏️ 编辑/重命名存储桶"
+    echo "======================================="
+    echo "💡 S3 不支持直接重命名存储桶。这里会按“创建新桶 → 同步旧桶文件 → 可选删除旧桶”的方式迁移。"
+
+    local old_bucket
+    local new_bucket
+    select_s3_bucket old_bucket "" || return
+    read_s3_bucket_name_only new_bucket "🪣 请输入新的 Bucket / 存储桶名称：" || return
+
+    if [[ "$old_bucket" == "$new_bucket" ]]; then
+        echo "❌ 新旧存储桶名称相同，无需编辑。"
+        return
+    fi
+
+    echo
+    echo "📦 旧存储桶：$old_bucket"
+    echo "🪣 新存储桶：$new_bucket"
+    read -rp "⚠️ 确认创建新桶并同步旧桶全部文件吗？(y/N)： " yn
+    if [[ ! "$yn" =~ ^[Yy]$ ]]; then
+        echo "ℹ️ 已取消迁移。"
+        return
+    fi
+
+    if ! run_aws s3 mb "s3://$new_bucket"; then
+        echo "❌ 创建新存储桶失败，已停止。"
+        return
+    fi
+
+    if ! run_aws s3 sync "s3://$old_bucket" "s3://$new_bucket"; then
+        echo "❌ 同步失败。新桶已创建，但旧桶未删除，请手动检查。"
+        return
+    fi
+
+    echo "✅ 文件已同步到新存储桶：$new_bucket"
+    read -rp "🗑 是否删除旧存储桶 $old_bucket 及其全部文件？(y/N)： " delete_old
+    if [[ "$delete_old" =~ ^[Yy]$ ]]; then
+        read -rp "🔒 请输入旧存储桶名称 [$old_bucket] 以确认： " confirm_name
+        if [[ "$confirm_name" == "$old_bucket" ]]; then
+            run_aws s3 rb "s3://$old_bucket" --force \
+                && echo "✅ 已删除旧存储桶：$old_bucket" \
+                || echo "❌ 删除旧存储桶失败，请手动检查。"
+        else
+            echo "❌ 名称不匹配，已保留旧存储桶。"
+        fi
+    else
+        echo "ℹ️ 已保留旧存储桶：$old_bucket"
+    fi
+}
+
+s3_bucket_menu_for_account() {
+    CHOSEN_ACCOUNT_ID=""
+    select_s3_account || { pause; return; }
+    local ACCOUNT_ID="$CHOSEN_ACCOUNT_ID"
+
+    load_s3_account "$ACCOUNT_ID" || { pause; return; }
+
+    while true; do
+        clear
+        echo "======================================="
+        echo "🪣 存储桶管理"
+        echo "======================================="
+        echo "👤 当前账号：$ACCOUNT_ID"
+        echo
+        echo "1) 📋 查看存储桶列表"
+        echo "2) ➕ 新增存储桶"
+        echo "3) ✏️ 编辑/重命名存储桶"
+        echo "4) 🗑 删除存储桶"
+        echo "0) ⬅ 返回账号管理"
+        echo
+        read -rp "👉 请输入选项编号： " choice
+
+        case "$choice" in
+            1) show_s3_buckets_for_current_account; pause ;;
+            2) create_s3_bucket_current_account; pause ;;
+            3) edit_s3_bucket_current_account; pause ;;
+            4) delete_s3_bucket_current_account; pause ;;
+            0) break ;;
+            *) echo "❌ 无效选项。"; pause ;;
+        esac
+    done
+}
+
 s3_uri_for() {
     local extra="$1"
     local prefix
@@ -333,6 +515,25 @@ s3_uri_for() {
     else
         printf 's3://%s' "$S3_BUCKET"
     fi
+}
+
+format_s3_ls_output() {
+    awk '
+        /^ *PRE / {
+            name=$2
+            printf "📁 %s\n", name
+            next
+        }
+        NF >= 4 {
+            name=$4
+            for (i=5; i<=NF; i++) name=name " " $i
+            printf "📄 %-40s %12s  %s %s\n", name, $3, $1, $2
+            next
+        }
+        NF {
+            print
+        }
+    '
 }
 
 select_s3_bucket_for_account() {
@@ -536,7 +737,19 @@ browse_s3_with_account() {
                 uri="$(s3_uri_for "$REMOTE_DIR")"
                 echo "📋 $uri 下的内容："
                 echo "---------------------------------------"
-                run_aws s3 ls "$uri/"
+                local raw_output
+                local list_output
+                if raw_output="$(run_aws s3 ls "$uri/" 2>&1)"; then
+                    list_output="$(printf '%s\n' "$raw_output" | format_s3_ls_output)"
+                    if [[ -n "$list_output" ]]; then
+                        printf '%s\n' "$list_output"
+                    else
+                        echo "ℹ️ 当前目录为空。"
+                    fi
+                else
+                    echo "❌ 列出目录失败，请检查路径和权限。"
+                    [[ -n "$raw_output" ]] && printf '%s\n' "$raw_output"
+                fi
                 echo "---------------------------------------"
                 pause
                 ;;
@@ -753,7 +966,7 @@ s3_account_menu() {
         echo "1) ➕ 新增账号"
         echo "2) ✏️ 修改账号"
         echo "3) 📋 查看账号列表"
-        echo "4) 🪣 查看账号存储桶"
+        echo "4) 🪣 新增/编辑/删除存储桶"
         echo "5) 🗑 删除账号"
         echo "6) 🔍 使用账号浏览/下载/删除文件"
         echo "0) ⬅ 返回主菜单"
@@ -764,13 +977,7 @@ s3_account_menu() {
             1) add_s3_account ;;
             2) edit_s3_account ;;
             3) show_s3_accounts ;;
-            4)
-                CHOSEN_ACCOUNT_ID=""
-                select_s3_account && {
-                    load_s3_account "$CHOSEN_ACCOUNT_ID" && show_s3_buckets_for_current_account
-                }
-                pause
-                ;;
+            4) s3_bucket_menu_for_account ;;
             5) delete_s3_account ;;
             6) browse_s3_with_account ;;
             0) break ;;
